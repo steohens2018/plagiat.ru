@@ -466,7 +466,7 @@ let S = {
   workType: 'none',        // Тип работы для проверки требований положения
   docxFormat: null,        // Результат проверки оформления загруженного DOCX
   checkTranslation: false, // Искать переводные заимствования (предложения уйдут нейросети)
-  keepHistory: true,       // Сохранять отчёты в историю на этом устройстве
+  keepHistory: false,      // Сохранять отчёты (с текстом работы) в историю — только с согласия
   autoBase: false          // Добавлять каждую проверенную работу в свою базу
 };
 try{
@@ -474,6 +474,8 @@ try{
   Object.assign(S, saved);
 }catch(e){}
 S.res = null; S.text = S.text || ''; S.docxFormat = null; S.chat = []; S.chatBusy = false;
+// Отправку предложений нейросети для поиска переводов каждый раз включают заново
+S.checkTranslation = false;
 
 function saveState(){
   try{
@@ -481,7 +483,6 @@ function saveState(){
       apiProvider: S.apiProvider,
       apiKey: S.apiKey,
       workType: S.workType,
-      checkTranslation: S.checkTranslation,
       keepHistory: S.keepHistory,
       autoBase: S.autoBase
     }));
@@ -3042,7 +3043,8 @@ const SECTION_NAMES = { title: 'Титульный лист', toc: 'Оглавл
 
 function docSections(text){
   const paras = [];
-  const re = /[^\n]+/g;
+  // Абзацы — по любому переводу строки (в том числе одиночному \r из старых файлов)
+  const re = /[^\n\r\u2028\u2029]+/g;
   let m;
   while((m = re.exec(text))){ const t = m[0].trim(); if(t) paras.push({ t, start: m.index, end: m.index + m[0].length }); }
   const out = {};
@@ -3057,11 +3059,15 @@ function docSections(text){
     const seen = new Set();
     for(let i = tocAt + 1; i < paras.length; i++){
       const p = paras[i];
-      const key = norm(p.t.replace(/[….]{2,}.*$/, '').replace(/\s\d{1,3}\s*$/, ''));
+      // Строка оглавления «Глава 1 ……… 5» → «глава 1»: обрезаем по первому ряду точек
+      // через search, без «.*$» — та давала катастрофический перебор на длинных рядах
+      const dots = p.t.search(/[….]{2}/);
+      const key = norm((dots >= 0 ? p.t.slice(0, dots) : p.t).replace(/\s\d{1,3}\s*$/, ''));
       if(p.t.length >= 160 || (!isTocLine(p.t) && seen.has(key))){ bodyAt = i; break; }
       seen.add(key);
     }
-    if(bodyAt > tocAt + 1) out.toc = [paras[tocAt].start, paras[bodyAt].start];
+    // Оглавление не бывает больше 15% работы — иначе это не оглавление
+    if(bodyAt > tocAt + 1 && paras[bodyAt].start - paras[tocAt].start <= text.length * 0.15) out.toc = [paras[tocAt].start, paras[bodyAt].start];
   }
   // Титульный лист — всё до оглавления или до «Введения» в начале работы
   const introAt = paras.findIndex((p, i) => i < 80 && p.t.length < 40 && /^введение\s*$/iu.test(p.t));
@@ -3070,7 +3076,9 @@ function docSections(text){
   // Список литературы — последний такой заголовок; приложения — после него
   const biblio = /^(список\s+(использован\p{L}*\s+)?(источников|литературы)|библиографическ\p{L}*\s+список|литература\s*:?$)/iu;
   let biblioAt = -1;
-  paras.forEach((p, i) => { if(p.t.length < 120 && !isTocLine(p.t) && biblio.test(p.t) && i > Math.max(tocAt, bodyAt)) biblioAt = i; });
+  // Список литературы — во второй половине работы: строка «Литература» после
+  // введения не должна исключать из проверки почти весь текст
+  paras.forEach((p, i) => { if(p.t.length < 120 && !isTocLine(p.t) && biblio.test(p.t) && i > Math.max(tocAt, bodyAt) && p.start >= text.length * 0.5) biblioAt = i; });
   const appendixAt = paras.findIndex((p, i) => i > biblioAt && biblioAt >= 0 && p.t.length < 60 &&
     /^приложени[еяй]\s*(№\s*\d+|\d+|[А-ЯA-Z])?\s*\.?$/u.test(p.t));
   if(biblioAt >= 0) out.biblio = [paras[biblioAt].start, appendixAt > 0 ? paras[appendixAt].start : text.length];
@@ -3136,6 +3144,8 @@ function recomputeResult(r, text){
   r.originality_percent = Math.max(0, round1(100 - r.borrowed_percent - r.self_citation_percent - r.citation_percent));
   r.edits_count = ed.off.length + ed.cite.length + Object.values(ed.exclude).filter(Boolean).length;
   r.excluded_sections = Object.keys(sections).filter(k => ed.exclude[k]).map(k => SECTION_NAMES[k]);
+  // Сколько текста исключено — проверяющий должен видеть объём, а не только названия
+  r.excluded_percent = round1(unionLength(excluded) / (text.length || 1) * 100);
 
   const charCount = text.length || 1;
   const searchFragments = raw.matches
@@ -3195,17 +3205,23 @@ function applySourceMatches(result, text, sources, matches){
 const LIB_DB = 'sp-lib';
 const HISTORY_MAX = 30;
 
+const LIB_BODY_MAX = 300000;   // символов основного текста одной работы
+const LIB_WORKS_MAX = 200;
+
 function libDb(){
   return new Promise((resolve, reject) => {
     if(!('indexedDB' in window)){ reject(new Error('браузер не поддерживает хранилище')); return; }
+    // Хранилище иногда «зависает» (Safari) — проверка не должна ждать его вечно
+    const timer = setTimeout(() => reject(new Error('хранилище не отвечает')), 4000);
     const rq = indexedDB.open(LIB_DB, 1);
+    rq.onblocked = () => { clearTimeout(timer); reject(new Error('хранилище занято другой вкладкой')); };
     rq.onupgradeneeded = () => {
       const db = rq.result;
       if(!db.objectStoreNames.contains('works')) db.createObjectStore('works', { keyPath: 'id' });
       if(!db.objectStoreNames.contains('history')) db.createObjectStore('history', { keyPath: 'id' });
     };
-    rq.onsuccess = () => resolve(rq.result);
-    rq.onerror = () => reject(rq.error);
+    rq.onsuccess = () => { clearTimeout(timer); resolve(rq.result); };
+    rq.onerror = () => { clearTimeout(timer); reject(rq.error); };
   });
 }
 async function libTx(store, mode, fn){
@@ -3234,7 +3250,7 @@ async function textHash(text){
 }
 
 async function addToLibrary(kind, title, text){
-  const body = mainBodyText(text);
+  const body = mainBodyText(text).slice(0, LIB_BODY_MAX);
   const words = tokenize(body).length;
   if(words < 30) throw new Error('слишком короткий текст');
   const hash = await textHash(text);
@@ -3245,6 +3261,7 @@ async function addToLibrary(kind, title, text){
     await libPut('works', existing);
     return existing;
   }
+  if((await libAll('works')).length >= LIB_WORKS_MAX) throw new Error(`в базе уже ${LIB_WORKS_MAX} работ — удалите лишние`);
   const rec = { id: newId(), kind, title: String(title || 'Без названия').slice(0, 200), body, words, hash, added: Date.now() };
   await libPut('works', rec);
   return rec;
@@ -3265,7 +3282,7 @@ async function librarySources(text){
 
 // История: отчёт сохраняется вместе с текстом, чтобы правки можно было продолжить
 async function saveHistory(){
-  if(S.keepHistory === false || !S.res) return;
+  if(S.keepHistory !== true || !S.res) return;
   try{
     const r = S.res;
     if(!r._histId){
@@ -3402,9 +3419,15 @@ async function runAnalysis(text, progressCallback){
   try{ library = await librarySources(text); }catch(e){ console.warn('Своя база недоступна:', e); }
   stats.library = library.length;
 
-  const all = [...sources, ...library];
+  // «Мои работы» сравниваются отдельно: если предложение есть и во внешнем
+  // источнике, это заимствование — своей работой его не «закрыть»
+  const own = library.filter(s => s.origin === 'own');
+  const all = [...sources, ...library.filter(s => s.origin !== 'own'), ...own];
   update(`Сравнение с текстами источников (${stats.withText + library.length})...`);
-  let matches = findMatches(text, all);
+  const ownFrom = all.length - own.length;
+  let matches = findMatches(text, all.slice(0, ownFrom));
+  const taken = new Set(matches.map(m => m.pos));
+  matches = matches.concat(findMatches(text, own).filter(m => !taken.has(m.pos)).map(m => ({ ...m, sourceIndex: m.sourceIndex + ownFrom })));
 
   // Переводные заимствования — только по галочке
   if(S.checkTranslation){
@@ -3715,6 +3738,7 @@ function editsHtml(r){
       источник — отключить, совпадение — пометить как цитату (вкладка «Источники»). Проценты пересчитываются сразу.</div>
     ${keys.map(k => `<label class="chk${found[k] ? '' : ' dis'}"><input type="checkbox" data-excl="${k}" ${ed.exclude[k] ? 'checked' : ''} ${found[k] ? '' : 'disabled'}>
       <span>Исключить: ${escapeHtml(SECTION_NAMES[k])}${found[k] ? ` <span class="m" style="color:var(--dim)">≈ ${escapeHtml(Math.max(1, Math.round(found[k] / CHARS_PER_PAGE)))} стр.</span>` : ' — не найден'}</span></label>`).join('')}
+    ${r.excluded_percent ? `<div class="hint" style="margin-top:6px">Исключено из проверки: ${escapeHtml(r.excluded_percent)}% текста.</div>` : ''}
     ${r.edits_count ? `<div class="hint" style="margin-top:10px">Отключено источников: ${escapeHtml(ed.off.length)} · помечено цитат: ${escapeHtml(ed.cite.length)}
       · <a href="#" id="resetEdits">сбросить правки</a></div>` : ''}
   </div>`;
@@ -4007,7 +4031,7 @@ async function renderLibraryBox(){
     const files = [...e.target.files];
     let added = 0;
     for(const file of files){
-      try{ await addToLibrary(e.target.dataset.kind, file.name, (await readFile(file)).replace(/\r\n/g, '\n')); added++; }
+      try{ await addToLibrary(e.target.dataset.kind, file.name, (await readFile(file)).replace(/\r\n?|\u2028|\u2029/g, "\n")); added++; }
       catch(err){ toast(`${file.name}: ${err.message}`, 'error', 5000); }
     }
     if(added) toast(`Добавлено: ${added}`, 'success');
@@ -4034,7 +4058,8 @@ async function renderHistoryBox(){
   $('#histBox summary').textContent = `История проверок (${items.length})`;
   const p = v => (v || 0).toFixed(0) + '%';
   box.innerHTML = `
-    <label class="chk"><input type="checkbox" id="keepHist" ${S.keepHistory !== false ? 'checked' : ''}><span>Сохранять отчёты на этом устройстве (последние ${HISTORY_MAX})</span></label>
+    <label class="chk"><input type="checkbox" id="keepHist" ${S.keepHistory === true ? 'checked' : ''}><span>Сохранять отчёты на этом устройстве (последние ${HISTORY_MAX})</span></label>
+    <div class="hint" style="margin:0 0 8px">В историю попадает и текст работы. Не включайте на общем компьютере.</div>
     ${items.length ? items.map(h => `<div class="lib-i">
       <div class="lib-b"><div class="lib-t"><a href="#" data-hopen="${escapeHtml(h.id)}">${escapeHtml(h.fn || 'Вставленный текст')}</a></div>
         <div class="lib-m">${escapeHtml(new Date(h.date).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }))}
@@ -4077,7 +4102,7 @@ async function loadFile(file){
   try{
     const text = await readFile(file);
     // Нормализация: убираем CRLF, неразрывные пробелы и лишние пробелы по краям
-    S.text = text.replace(/\r\n/g, '\n').replace(/\u00a0/g, ' ').trim();
+    S.text = text.replace(/\r\n?|\u2028|\u2029/g, '\n').replace(/\u00a0/g, ' ').trim();
     // Оформление можно проверить только у DOCX: в PDF и TXT стилей Word нет
     S.docxFormat = null;
     if(file.name.toLowerCase().endsWith('.docx')){
@@ -4524,7 +4549,10 @@ function reportHTML(r, fn, aiOnly){
     (st && st.translation && !st.translation.error ? ` Переводы: ${st.translation.sentences} предложений, ${st.translation.checked} англоязычных статей.` : '') +
     // Правки отчёта видны и в скачанном файле: проверяющий должен знать, что исключено
     (r.edits_count ? ` Правки отчёта: отключено источников — ${(r.edits && r.edits.off.length) || 0}, вручную отмечено цитат — ${(r.edits && r.edits.cite.length) || 0}` +
-      (r.excluded_sections && r.excluded_sections.length ? `, исключены разделы: ${r.excluded_sections.join(', ')}` : '') + '.' : '');
+      (r.excluded_sections && r.excluded_sections.length ? `, исключены разделы: ${r.excluded_sections.join(', ')} (${r.excluded_percent}% текста)` : '') + '.' : '') +
+    // «Мои работы» добавляет сам пользователь — авторство сервис не проверяет
+    (r.self_citation_percent > 0 ? ` Самоцитирование — по работам, которые пользователь сам отметил как свои (авторство не проверяется): ${
+      (r.sources || []).filter(s => s.origin === 'own' && s.match_percent >= 0 && (s.matches || []).length).map(s => s.title).join('; ')}.` : '');
 
   // Цвета для разных типов фрагментов в отчёте
   const fragmentColors = {
@@ -4978,7 +5006,7 @@ async function addGroupFiles(files){
   for(const file of files){
     if(G.works.length >= GROUP_MAX_WORKS){ errors.push(`Больше ${GROUP_MAX_WORKS} работ за раз не сравниваем`); break; }
     try{
-      const text = (await readFile(file)).replace(/\r\n/g, '\n').replace(/ /g, ' ').trim();
+      const text = (await readFile(file)).replace(/\r\n?|\u2028|\u2029/g, "\n").replace(/ /g, ' ').trim();
       const body = mainBodyText(text);
       const analysis = localAnalyze(text);
       let formatFailed = null;
