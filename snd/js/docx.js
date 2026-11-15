@@ -143,8 +143,8 @@ function checkDocx(bytes, name, data, c){
 
   // 1. Шрифт
   const fonts = new Set(), src = parts.document + parts.styles + parts.footnotes;
-  for(const m of src.matchAll(/w:(?:ascii|hAnsi|cs|eastAsia)="([^"]*)"/g)) fonts.add(m[1]);
-  const theme = /w:(?:ascii|hAnsi|cs|eastAsia)Theme=/.test(src);
+  for(const tag of src.match(/<w:rFonts[^>]*>/g) || []) for(const m of tag.matchAll(/w:(?:ascii|hAnsi|cs|eastAsia)="([^"]*)"/g)) fonts.add(m[1]);
+  const theme = /<w:rFonts[^>]*Theme=/.test(src);
   const def = /<w:rPrDefault>[\s\S]*?w:ascii="PT Astra Serif"/.test(parts.styles);
   const runsNoFont = (parts.document.match(/<w:r>(?!<w:rPr>[\s\S]*?<w:rFonts)(?=<w:t|<w:rPr>(?![\s\S]*?<\/w:rPr>[\s\S]*?<w:rFonts))/g) || []).length;
   add('Шрифт PT Astra Serif во всём файле', fonts.size === 1 && fonts.has(FONT_NAME) && !theme && (def || !runsNoFont),
@@ -246,7 +246,7 @@ function mergeDocx(list){
     } else d.inner = d.inner.replace(/<w:footnoteReference[^>]*\/>/g, '');
     d.sect = d.sect.replace(/<w:(?:header|footer)Reference[^>]*\/>/g, '');
   });
-  const body = docs.map((d, i) => d.inner + (i < docs.length - 1 ? `<w:p><w:pPr>${d.sect}</w:pPr></w:p>` : d.sect)).join('');
+  const body = docs.map((d, i) => d.inner + (i < docs.length - 1 ? `<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/><w:rPr><w:sz w:val="2"/></w:rPr>${d.sect}</w:pPr></w:p>` : d.sect)).join('');
   // Пространства имён остальных документов добавляем в корень основы
   let root = /<w:document[^>]*>/.exec(base.xml)[0];
   docs.forEach(d => { for(const m of /<w:document[^>]*>/.exec(d.xml)[0].matchAll(/\sxmlns:[\w]+="[^"]+"/g)) if(!root.includes(m[0].trim().split('=')[0] + '=')) root = root.replace(/>$/, m[0] + '>'); });

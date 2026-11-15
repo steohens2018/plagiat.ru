@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>СНД — пакет документов</title>
+<meta name="description" content="Пакет документов для списания материала в номенклатурное дело. Работает на устройстве.">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0b0c0f">
+<meta name="referrer" content="no-referrer">
+<!-- Скрипты — только свои файлы; сеть — только HTTPS (нейросеть и свой прокси) -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self'; img-src 'self' blob: data:; connect-src 'self' https: blob: data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="СНД">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body data-state="boot">
+<header class="top" id="top" hidden>
+  <button type="button" class="icon" id="backBtn" aria-label="Назад" hidden>
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+  </button>
+  <h1 id="title">СНД</h1>
+  <span class="net" id="net" hidden>без сети</span>
+  <button type="button" class="icon" id="setBtn" aria-label="Настройки">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+  </button>
+  <button type="button" class="icon" id="lockBtn" aria-label="Заблокировать">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+  </button>
+</header>
+<main id="app" class="wrap"><p class="muted center">Загрузка…</p></main>
+<div id="toasts" aria-live="polite"></div>
+<input type="file" id="fileCam" accept="image/*" capture="environment" hidden>
+<input type="file" id="fileAny" accept="image/*,.heic,.heif" multiple hidden>
+<input type="file" id="fileDocx" accept=".docx" hidden>
+<input type="file" id="fileBackup" hidden>
+<script src="vendor/pizzip.min.js" defer></script>
+<script src="vendor/docxtemplater.min.js" defer></script>
+<script src="js/util.js" defer></script>
+<script src="js/decl.js" defer></script>
+<script src="js/data.js" defer></script>
+<script src="js/store.js" defer></script>
+<script src="js/mask.js" defer></script>
+<script src="js/photo.js" defer></script>
+<script src="js/ai.js" defer></script>
+<script src="js/docx.js" defer></script>
+<script src="js/selfdata.js" defer></script>
+<script src="js/selftest.js" defer></script>
+<script src="js/app.js" defer></script>
+</body>
+</html>
