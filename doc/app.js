@@ -192,14 +192,31 @@ async function unlock(pin){
   S.cases = Array.isArray(data) ? data : (data.cases || []);      // прежний формат — просто массив
   S.zips = data.zips || {};
   S.ai = data.ai || {};
+  S.photos = {};
+  // Ключ образцов; у установки прежней версии его ещё нет — создаём
+  let rawSk;
+  if(meta.sk) rawSk = await unseal(key, meta.sk);
+  else{ rawSk = toB64(crypto.getRandomValues(new Uint8Array(32))); meta.sk = await seal(key, rawSk); saveJson(LS_PIN, meta); }
+  sampleKey = await importSampleKey(rawSk); sampleKeyRaw = rawSk;
   cryptoKey = key;
   await loadSamples();
 }
+// Образцы шифруются отдельным случайным ключом; сам он хранится рядом с паролем,
+// зашифрованный ключом из пароля. Поэтому при смене пароля образцы не трогаются:
+// перешифровывается только этот ключ — одной записью вместе с новым паролем.
+let sampleKey = null, sampleKeyRaw = null;
+const importSampleKey = raw => crypto.subtle.importKey('raw', fromB64(raw), 'AES-GCM', false, ['encrypt', 'decrypt']);
 async function setPin(pin){
+  const gen = lockGen, changing = pinEnabled();
+  // Снимок данных — до первого ожидания: если приложение заблокируют, пустое не запишется
+  const snap = { cases: S.cases, zips: S.zips, ai: S.ai };
+  const rawSk = sampleKeyRaw || toB64(crypto.getRandomValues(new Uint8Array(32)));
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await deriveKey(pin, salt);
-  const meta = { salt: toB64(salt), check: await seal(key, CHECK_TEXT) };
-  const box = await seal(key, { cases: S.cases, zips: S.zips, ai: S.ai });
+  const meta = { salt: toB64(salt), check: await seal(key, CHECK_TEXT), sk: await seal(key, rawSk) };
+  const box = await seal(key, snap);
+  const sk = await importSampleKey(rawSk);
+  if(changing && !stillOpen(gen)) throw new Error('приложение было заблокировано — пароль не изменён');
   // Открытые копии удаляем, только если шифрованные точно записались; при смене
   // пароля и сбое записи возвращаем прежний шифр — данные остаются под старым паролем
   const prevEnc = localStorage.getItem(LS_ENC), prevPin = localStorage.getItem(LS_PIN);
@@ -210,10 +227,8 @@ async function setPin(pin){
     }catch(e){}
     throw new Error('память браузера заполнена — оставлено как было');
   }
-  cryptoKey = key;
+  cryptoKey = key; sampleKey = sk; sampleKeyRaw = rawSk;
   localStorage.removeItem(LS_CASES); localStorage.removeItem(LS_ZIPS);
-  // Новый пароль — новый ключ: образцы перешифровываются им
-  await resealSamples().catch(() => toast('Образцы не удалось сохранить под новым паролем', 'error', 6000));
 }
 // Пароля «нет» больше не бывает: без него ключ нейросети и материалы лежали бы открыто.
 async function checkPin(pin){
@@ -279,6 +294,7 @@ function wipeAll(){
   for(const k of [LS_ENC, LS_PIN, LS_CASES, LS_ZIPS, LS_CURRENT, LS_FAILS]) localStorage.removeItem(k);
   try{ sessionStorage.clear(); }catch(e){}
   S.cases = []; S.zips = {}; S.photos = {}; S.ai = {}; S.attach = []; S.draft = ''; S.samples = []; S.pending = null; cryptoKey = null;
+  sampleKey = null; sampleKeyRaw = null;
   clearSamples();
 }
 function lock(){
@@ -287,6 +303,8 @@ function lock(){
   if(cryptoKey) saveEncrypted().catch(() => {});
   lockGen++;
   cryptoKey = null; S.cases = []; S.zips = {}; S.photos = {}; S.ai = {}; S.attach = []; S.draft = ''; S.samples = []; S.pending = null;
+  sampleKey = null; sampleKeyRaw = null; aiNote = null;
+  for(const cancel of [...openAsks]) cancel();       // окна «Что уйдёт в ИИ» и «Ключ» — закрыть с ответом «нет»
   $$('.modal,.busy').forEach(m => m.remove());
   $('#toasts').innerHTML = '';                 // в уведомлениях бывают имена файлов с фамилиями
   renderLock();
@@ -2063,15 +2081,16 @@ function aiPayload(c, kind, ps){
   const fields = Object.fromEntries(Object.entries(AI_FIELDS[kind]).filter(([k]) => !(free && LOCAL_RIGHTS[kind] === k)));
   const current = Object.fromEntries(Object.keys(fields).map(k => [k, ps.apply(c[kind][k] || '')]));
   // То, что пользователь писал в чате раньше, — тоже материалы для документа
-  const earlier = (c.chat || []).filter(m => m.r === 'u' && m.t).slice(0, -1).slice(-6).map(m => '— ' + m.t.slice(0, 600));
-  const base = baseContext(c, [c.task, c.facts, earlier.join(' '), c.rf && c.rf.article, c.ad && c.ad.article, (c.source || '').slice(0, 1500)].filter(Boolean).join(' '), kind);
+  const earlierRaw = (c.chat || []).filter(m => m.r === 'u' && m.t).slice(0, -1).slice(-6).map(m => m.t);
+  const earlier = earlierRaw.map(t => '— ' + ps.apply(t).slice(0, 600));      // сначала обезличить, потом обрезать
+  const base = baseContext(c, [c.task, c.facts, earlierRaw.join(' '), c.rf && c.rf.article, c.ad && c.ad.article, (c.source || '').slice(0, 1500)].filter(Boolean).join(' '), kind);
   const userText = [
     `Документ: ${DOCS[kind].name}.`,
     `Пол заявителя: ${sex}.`,
     `Адрес заявителя: ${c.addr ? ps.apply([c.city, c.addr].filter(Boolean).join(', ')) : '—'}`,
     `Что сообщил заявитель: ${ps.apply(c.facts) || '—'}`,
     `Материалы (объяснения, заметки, текст документов):\n${ps.apply(c.source).slice(0, free ? 6000 : 24000) || '—'}`,
-    earlier.length ? `Ранее в этом чате пользователь писал:\n${ps.apply(earlier.join('\n'))}` : '',
+    earlier.length ? `Ранее в этом чате пользователь писал:\n${earlier.join('\n')}` : '',
     `Текущие тексты документа: ${JSON.stringify(current)}`,
     ps.apply(`Реквизиты: рапорт пишется «${[s.chief1, s.chief2, s.chiefRank, s.chiefName].filter(Boolean).join(' / ')}»; исполнитель — ${[s.pos1, s.pos2, s.rank].filter(Boolean).join(' ')}; подразделение — ${s.orgShort}.`),
     `Задача: ${ps.apply(c.task) || 'Составь тексты для документа по материалам.'}`,
@@ -2100,8 +2119,18 @@ async function freeSlot(){
   freeNextAt = Date.now() + FREE_AI.gap;
 }
 
+// Показывать ли «Что уйдёт в ИИ». Даже при отключённом показе спрашиваем один раз,
+// если ключ пропал и запросы пошли бы в бесплатную нейросеть без ведома пользователя.
+let keyedThisSession = false, freeConfirmed = false;
+function needConfirm(){
+  const free = aiConn().p === 'free';
+  if(!free) keyedThisSession = true;
+  if(S.settings.confirmAi !== 'нет') return true;
+  return free && keyedThisSession && !freeConfirmed;
+}
 // Один запрос к нейросети: сообщения в формате OpenAI → текст ответа
 async function aiRequest(messages, { json = false, temperature = 0.2 } = {}){
+  const gen = lockGen;
   const conn = aiConn();
   const gemini = conn.p === 'gemini', free = conn.p === 'free';
   const name = AI_PROVIDERS[conn.p].name;
@@ -2110,14 +2139,16 @@ async function aiRequest(messages, { json = false, temperature = 0.2 } = {}){
     systemInstruction: { parts: [{ text: sys }] },
     contents: messages.filter(m => m.role !== 'system').map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
     generationConfig: Object.assign({ temperature, maxOutputTokens: 8192 }, json ? { responseMimeType: 'application/json' } : {})
-  } : free ? { model: conn.model, messages, temperature }
+  } : free ? { model: conn.model, messages, temperature, private: true }
     : { model: conn.model, messages, max_tokens: 4000, temperature };
   const headers = { 'Content-Type': 'application/json' };
   if(gemini) headers['x-goog-api-key'] = conn.key;
   else if(!free) headers.Authorization = 'Bearer ' + conn.key;
 
   for(let attempt = 0; ; attempt++){
-    if(free){ await freeSlot(); if(aiNote) aiNote('Нейросеть без ключа пишет ответ — обычно 20–40 секунд…'); }
+    // После блокировки (даже если приложение уже снова открыли) старый запрос не повторяется
+    if(!stillOpen(gen)) throw new Error('приложение заблокировано');
+    if(free){ await freeSlot(); if(!stillOpen(gen)) throw new Error('приложение заблокировано'); if(aiNote) aiNote('Нейросеть без ключа пишет ответ — обычно 20–40 секунд…'); }
     const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), 150e3);
     let res;
     try{
@@ -2168,13 +2199,20 @@ async function callAi(userText, schema, system = AI_SYSTEM){
 }
 
 // Показать, что именно уйдёт в ИИ, и спросить подтверждение
+// Открытые окна-вопросы: при блокировке они закрываются с ответом «нет»,
+// чтобы ожидающая операция завершилась, а не повисла
+const openAsks = new Set();
 function confirmPayload(text){
   if(!cryptoKey) return Promise.resolve(false);
   return new Promise(resolve => {
     const box = document.createElement('div');
     box.className = 'modal';
+    const cancel = () => { openAsks.delete(cancel); box.remove(); resolve(false); };
+    openAsks.add(cancel);
+    const conn = aiConn();
     const marked = escapeHtml(text).replace(TOKEN_RE, '<mark>⟦$1⟧</mark>');
     box.innerHTML = `<div class="modal-h"><div class="modal-t">Что уйдёт в ИИ</div></div>
+      <div class="note">Получатель: <b>${conn.p === 'free' ? 'нейросеть без ключа (Pollinations, запрос помечен как непубличный)' : escapeHtml(AI_PROVIDERS[conn.p].name)}</b>.</div>
       <div class="note">Личные данные заменены <b style="color:var(--gold)">метками</b>. Проверьте, не осталось ли ФИО, адресов
         или номеров, — если остались, отмените и уберите их из полей.</div>
       <div class="modal-b"><div class="payload">${marked}</div></div>
@@ -2185,7 +2223,8 @@ function confirmPayload(text){
       if(!a) return;
       // Отключить показ может только сам пользователь и только отправляя
       if(a === 'yes' && box.querySelector('#noConfirm').checked){ S.settings.confirmAi = 'нет'; saveJson(LS_SETTINGS, S.settings); }
-      box.remove(); resolve(a === 'yes');
+      if(a === 'yes' && aiConn().p === 'free') freeConfirmed = true;
+      openAsks.delete(cancel); box.remove(); resolve(a === 'yes');
     });
     document.body.appendChild(box);
   });
@@ -2193,6 +2232,8 @@ function confirmPayload(text){
 
 // Тексты от ИИ. Возвращает true, если тексты получены; подробности последнего
 // вызова — в aiLast (для ответа в чате): ошибка, отмена, что вписано, что взято из базы.
+// Есть ли у документа тексты (статья — реквизит, она не в счёт)
+const hasTexts = (c, kind) => Object.keys(AI_FIELDS[kind]).some(k => k !== 'article' && (c[kind][k] || '').trim());
 let aiLast = {};
 async function aiWrite(c, kind){
   const gen = lockGen;
@@ -2201,7 +2242,7 @@ async function aiWrite(c, kind){
   const { userText, schema, used, hint } = aiPayload(c, kind, ps);
   aiLast.used = used; aiLast.hint = hint;
   const taskPs = ps.apply(c.task || '');
-  if(S.settings.confirmAi !== 'нет' && !(await confirmPayload(userText))){ aiLast.cancel = true; return false; }
+  if(needConfirm() && !(await confirmPayload(userText))){ aiLast.cancel = true; return false; }
   if(!stillOpen(gen)) return false;
   const btn = $('#aiGo'), make = $('#makeAll');
   for(const b of [btn, make]) if(b){ b.disabled = true; }
@@ -2244,7 +2285,7 @@ async function runAi(c, kind){
 // «Сделать готовый документ»: ИИ пишет тексты (если есть задача или тексты
 // пустые), приложение проверяет заполненность и сразу отдаёт DOCX.
 async function makeAll(c, kind){
-  const empty = Object.keys(AI_FIELDS[kind]).every(k => !(c[kind][k] || '').trim());
+  const empty = !hasTexts(c, kind);
   const hasMaterial = [c.facts, c.source, c.task].some(v => (v || '').trim());
   if((c.task || '').trim() || (empty && hasMaterial)){
     if(!(await aiWrite(c, kind))){ renderCaseKeepScroll(c.id); return; }
@@ -2312,7 +2353,8 @@ const IC = {
   up: svgI('<path d="M12 19V5M6 11l6-6 6 6"/>'),
   doc: svgI('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>', 22),
   copy: svgI('<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>', 16),
-  retry: svgI('<path d="M4 12a8 8 0 0 1 13.7-5.7L20 8M20 4v4h-4M20 12a8 8 0 0 1-13.7 5.7L4 16M4 20v-4h4"/>', 16)
+  retry: svgI('<path d="M4 12a8 8 0 0 1 13.7-5.7L20 8M20 4v4h-4M20 12a8 8 0 0 1-13.7 5.7L4 16M4 20v-4h4"/>', 16),
+  plus16: svgI('<path d="M12 5v14M5 12h14"/>', 16)
 };
 
 // --- Боковая панель: чаты по дням ------------------------------------------------
@@ -2482,6 +2524,11 @@ function msgHtml(c, m, i, lastDoc, isLast){
   return `<div class="msg a${m.err ? ' err' : ''}"><div class="av">Д</div><div class="msg-b">
     <div class="md">${mdHtml(m.t)}</div>
     ${doc ? (lastDoc[doc] === i ? docCardHtml(c, doc) : '<div class="doc-old">Документ обновлён ниже</div>') : ''}
+    ${(m.finds || []).map((f, j) => `<div class="find"><div class="find-h">${escapeHtml(f.ref)}${f.title ? ' — ' + escapeHtml(f.title) : ''}</div>
+      <div class="find-t">«${escapeHtml(f.text)}»</div>
+      <div class="acts"><button data-fcopy="${i}:${j}">${IC.copy} Копировать</button>${
+        c.kind && INSERT_FIELD[c.kind] ? `<button data-fins="${i}:${j}">${IC.plus16} Вставить в документ</button>` : ''}</div></div>`).join('')}
+    ${m.base ? '<a class="btn sm" href="#laws" style="margin-top:8px">Открыть базу</a>' : ''}
     ${m.hint ? `<details class="hintbox"><summary>Подсказка по квалификации</summary><div>${escapeHtml(m.hint)}</div></details>` : ''}
     ${m.used && m.used.length ? `<div class="used">Из базы: ${m.used.map(escapeHtml).join(' · ')}</div>` : ''}
     <div class="acts"><button data-copy="${i}">${IC.copy} Копировать</button>${
@@ -2498,7 +2545,8 @@ const STARTERS = [
   ['Запрос записей камер', 'Составь запрос о предоставлении записей камер видеонаблюдения. Адрес и время: '],
   ['Ориентировка', 'Сделай ориентировку. Что произошло и приметы: '],
   ['Перепечатать с фото', 'Перепечатай документ с фото'],
-  ['Что собрать по краже?', 'Что нужно собрать по материалу о краже, чтобы принять решение в срок?']
+  ['Что собрать по краже?', 'Что нужно собрать по материалу о краже, чтобы принять решение в срок?'],
+  ['Найти в пленуме', 'Найди в пленуме о краже: ']
 ];
 function emptyChatHtml(){
   const s = S.settings;
@@ -2518,14 +2566,14 @@ function emptyChatHtml(){
     <button class="linkbtn" id="newCase">Заполнить документ вручную, без нейросети</button>
   </div>`;
 }
+const netHint = () => isOffline() ? 'нет интернета — работаю по базе и шаблонам' : aiConn().p === 'free' ? 'нейросеть без ключа' : AI_PROVIDERS[aiConn().p].name;
 function composerHtml(){
-  const conn = aiConn();
   return `<div class="composer"><div class="comp-box">
     <div class="chips" id="atts">${attachHtml()}</div>
     <textarea id="msg" rows="1" placeholder="Напишите задачу или вопрос…">${escapeHtml(S.draft)}</textarea>
     <div class="comp-row">
       <button class="ic-btn" id="attBtn" aria-label="Приложить фото или файл">${IC.plus}</button>
-      <span class="comp-hint">${conn.p === 'free' ? 'нейросеть без ключа' : escapeHtml(AI_PROVIDERS[conn.p].name)}</span>
+      <span class="comp-hint" id="compHint">${escapeHtml(netHint())}</span>
       <button class="send" id="send" aria-label="Отправить"${S.pending ? ' disabled' : ''}>${IC.up}</button>
     </div>
   </div>
@@ -2558,7 +2606,7 @@ function renderChat(id){
   $('#attBtn').onclick = () => {
     const fi = $('#taskFile');
     fi.accept = '.doc,.docx,.rtf,.pdf,.txt,image/*'; fi.value = '';
-    fi.onchange = () => { S.attach.push(...fi.files); drawAtt(); };
+    fi.onchange = () => { if(!cryptoKey) return; S.attach.push(...fi.files); drawAtt(); };
     fi.click();
   };
   const submit = () => {
@@ -2593,6 +2641,14 @@ function renderChat(id){
   $$('#meCard [data-s]').forEach(el => el.addEventListener('input', () => { S.settings[el.dataset.s] = el.value.trim(); saveJson(LS_SETTINGS, S.settings); }));
   $$('[data-copy]').forEach(b => b.onclick = () => copyPlain(msgs[+b.dataset.copy].t));
   $$('[data-retry]').forEach(b => b.onclick = () => retryLast(c));
+  const findAt = v => { const [i, j] = v.split(':').map(Number); return (msgs[i].finds || [])[j]; };
+  $$('[data-fcopy]').forEach(b => b.onclick = () => { const f = findAt(b.dataset.fcopy); if(f) copyPlain(`${findSource(f)}: «${f.text}»`); });
+  $$('[data-fins]').forEach(b => b.onclick = () => {
+    const f = findAt(b.dataset.fins);
+    if(!f || S.pending || !insertExcerpt(c, f)) return;
+    c.chat.push({ r: 'a', t: `Вставил в документ дословную выдержку: ${findSource(f)}. Проверьте, что редакция действующая.`, doc: c.kind, ts: Date.now() });
+    saveCases(); renderChat(c.id);
+  });
   $$('[data-word]').forEach(b => b.onclick = () => deliverDocx(b.dataset.word, c).catch(e => toast('Ошибка: ' + e.message, 'error')));
   $$('[data-open]').forEach(a => a.addEventListener('click', () => { c.kind = a.dataset.open; S.doc = c.kind; }));
   $$('[data-key]').forEach(b => b.onclick = async () => { const r = await askKey(); if(r === 'login') startLogin(); else if(r) retryLast(c); });
@@ -2617,6 +2673,7 @@ function pickIntent(c, text, files){
   if(files.length) return 'doc';
   const t = text.trim(), hasDoc = !!c.kind;
   if(MAKE_RE.test(t)) return 'doc';
+  if(isFind(t)) return 'find';                                              // поиск по базе — без нейросети
   if(ASK_RE.test(t)) return hasDoc && IN_DOC_RE.test(t) ? 'doc' : 'ask';     // «разъясни права в уведомлении» — правка
   if(hasDoc) return 'doc';                                                      // всё остальное в чате с документом — уточнение
   if(detectKind(t) || DATA_RE.test(t) || EDIT_RE.test(t) || MAKE_INF_RE.test(t)) return 'doc';
@@ -2640,7 +2697,18 @@ async function runTurn(c, text, files, again){
   renderSide();
   let reply;
   try{
-    reply = pickIntent(c, text, files) === 'doc' ? await docTurn(c, text, files, note) : await askTurn(c, text, note);
+    const intent = pickIntent(c, text, files);
+    if(intent === 'find') reply = findTurn(c, text);
+    else if(intent === 'doc') reply = await docTurn(c, text, files, note);
+    else if(isOffline()) reply = localAnswer(c, text, 'Интернета нет.');
+    else{
+      try{ reply = await askTurn(c, text, note); }
+      catch(e){
+        // Нейросеть недоступна — отвечаем тем, что есть в базе
+        if(!NET_ERR_RE.test(e.message) || !stillOpen(gen)) throw e;
+        reply = Object.assign(localAnswer(c, text, `Нейросеть сейчас недоступна: ${e.message}.`), { key: aiConn().p === 'free' });
+      }
+    }
   }catch(e){
     reply = { t: 'Не получилось: ' + e.message + '.', err: true, key: /ключ|нейросет/i.test(e.message) && aiConn().p === 'free' };
   }
@@ -2773,11 +2841,11 @@ async function docTurn(c, task, files, note){
     if(!stillOpen(gen)) return null;
     if(f.size > 25 * 1024 * 1024){ toast(`${f.name}: больше 25 МБ`, 'error'); continue; }
     try{
-      if(isImage(f) && (kind === 'photo' || kind === 'or') && mode !== 'retype') await addPhoto(c.id, f);
+      if(isImage(f) && (kind === 'photo' || kind === 'or') && mode !== 'retype'){ await addPhoto(c.id, f); if(!stillOpen(gen)){ delete S.photos[c.id]; return null; } }
       else if(isImage(f)) texts.push(await ocrImage(f, p => note(`Распознаю фото… ${Math.round(p * 100)}%`)));
       else if(mode === 'blank' && !blankFile && /\.docx$/i.test(f.name)) blankFile = f;
       else texts.push(await anyText(await f.arrayBuffer(), f.name.toLowerCase()));
-    }catch(err){ toast(`${f.name}: ${err.message}`, 'error', 6000); }
+    }catch(err){ if(!stillOpen(gen)) return null; toast(`${f.name}: ${err.message}`, 'error', 6000); }
   }
   if(!stillOpen(gen)) return null;
   const text = texts.filter(t => t && t.trim()).join('\n\n').trim();
@@ -2805,16 +2873,38 @@ async function docTurn(c, task, files, note){
   if(mode === 'blank'){
     note('Заполняю бланк…');
     const { blob, filled, blanks } = await fillBlank(await blankFile.arrayBuffer(), c);
+    if(!stillOpen(gen)) return null;
     await deliverBlob(blob, blankFile.name.replace(/\.docx$/i, '') + ' (заполнено).docx');
     return { t: `Заполнил бланк: полей — ${filled}${blanks > filled ? ` из ${blanks}, остальные оставлены для руки` : ''}. Файл сохранён.` };
   }
   c.task = task || 'Составь документ по материалам.';
   if(c.addr && !c.zip){ const z = knownZip(c.city, c.addr); if(z){ c.zip = z; c.zipNote = 'индекс из запомненных'; } }
   touch(c);
-  note(first ? 'Пишу документ…' : 'Вношу изменения…');
-  const ok = await aiWrite(c, kind);
-  if(!stillOpen(gen)) return null;
-  const hasText = Object.keys(AI_FIELDS[kind]).some(k => (c[kind][k] || '').trim());
+  const offline = isOffline();
+  const emptyBefore = !hasTexts(c, kind);
+  let ok = false;
+  if(offline) aiLast = { ok: false, err: '', cancel: false, changed: [], used: [], hint: '' };
+  else{
+    note(first ? 'Пишу документ…' : 'Вношу изменения…');
+    ok = await aiWrite(c, kind);
+    if(!stillOpen(gen)) return null;
+  }
+  if(!ok && !aiLast.cancel && (offline || NET_ERR_RE.test(aiLast.err))){
+    // Сети или нейросети нет: новый документ собираем по шаблону, в готовый вписываем только данные
+    const why = offline ? 'Интернета нет' : `Нейросеть сейчас недоступна (${aiLast.err})`;
+    for(const x of fillFromPast(c)) if(!past.includes(x)) past.push(x);
+    if(emptyBefore && localDraft(c, kind, task)){
+      return { t: [`${why} — собрал черновик по шаблону, без нейросети. Проверьте формулировки. Когда появится сеть, нажмите «Повторить» — нейросеть перепишет текст.`,
+        legal.length ? 'Вписал из задачи: ' + [...new Set(legal)].join(', ') + '.' : '', ...tail()].filter(Boolean).join('\n\n'),
+        doc: kind, local: true, key: !offline && aiConn().p === 'free', hint: theftHint(task) || undefined };
+    }
+    if(!emptyBefore){
+      return { t: [legal.length ? `${why}. Данные вписал без нейросети: ${[...new Set(legal)].join(', ')}.`
+          : `${why}. Изменить формулировки без нейросети не могу — поправьте вручную или нажмите «Повторить», когда появится сеть.`, ...tail()].join('\n\n'),
+        doc: kind, local: true, err: !legal.length, key: !offline && aiConn().p === 'free' };
+    }
+  }
+  const hasText = hasTexts(c, kind);
   if(aiLast.cancel) return { t: 'Отправка в нейросеть отменена. Материалы сохранены в этом чате — нажмите «Повторить», когда будете готовы.', err: true, doc: hasText ? kind : undefined };
   if(!ok){
     return { t: `Нейросеть не ответила: ${aiLast.err || 'неизвестная ошибка'}. Материалы сохранены — нажмите «Повторить».`, err: true,
@@ -2845,7 +2935,7 @@ async function askTurn(c, text, note){
   const base = baseContext(c, [text, c.facts, history.filter(m => m.r === 'u').map(m => m.t).join(' ')].filter(Boolean).join(' '), kind);
   const state = [];
   if(kind){
-    const fields = Object.fromEntries(Object.keys(AI_FIELDS[kind]).map(k => [k, ps.apply((c[kind][k] || '').slice(0, free ? 500 : 1500))]).filter(([, v]) => v));
+    const fields = Object.fromEntries(Object.keys(AI_FIELDS[kind]).map(k => [k, ps.apply(c[kind][k] || '').slice(0, free ? 500 : 1500)]).filter(([, v]) => v));
     state.push(`В этом чате составлен документ «${DOCS[kind].name}». Его тексты: ${JSON.stringify(fields)}`);
   }
   if(c.source) state.push('Материалы пользователя (с фото и из файлов):\n' + ps.apply(c.source).slice(0, free ? 3000 : 10000));
@@ -2854,7 +2944,7 @@ async function askTurn(c, text, note){
     ...history.map(m => ({ role: m.r === 'u' ? 'user' : 'assistant', content: ps.apply(m.t || (m.f || []).join(', ') || '…').slice(0, 1500) })),
     { role: 'user', content: ps.apply(text) }
   ];
-  if(S.settings.confirmAi !== 'нет'){
+  if(needConfirm()){
     const shown = messages.map(m => `[${m.role === 'system' ? 'правила и база' : m.role === 'user' ? 'вы' : 'помощник'}]\n${m.content}`).join('\n\n');
     if(!(await confirmPayload(shown))) return { t: 'Отправка в нейросеть отменена.', err: true };
   }
@@ -2882,6 +2972,8 @@ function askKey(){
   return new Promise(resolve => {
     const box = document.createElement('div');
     box.className = 'modal';
+    const cancel = () => { openAsks.delete(cancel); box.remove(); resolve(false); };
+    openAsks.add(cancel);
     box.innerHTML = `<div class="modal-h"><div class="modal-t">Свой ключ нейросети</div></div>
       <div class="modal-b"><div class="card">
         <label class="f"><span>Ключ нейросети</span><input id="askKeyIn" autocomplete="off" placeholder="sk_…, sk-or-… или AIza…"></label>
@@ -2898,7 +2990,7 @@ function askKey(){
         S.ai = { key: k, model: '' }; saveCases();
         toast(`Ключ ${AI_PROVIDERS[providerOf(k)].name} сохранён`, 'success');
       }
-      box.remove(); resolve(a === 'save' ? true : a === 'login' ? 'login' : false);
+      openAsks.delete(cancel); box.remove(); resolve(a === 'save' ? true : a === 'login' ? 'login' : false);
     });
     document.body.appendChild(box);
     setTimeout(() => $('#askKeyIn')?.focus(), 50);
@@ -2945,7 +3037,7 @@ ${miss.length ? `<div class="note warn"><b>Не хватает:</b> ${miss.map(e
   $('#kindSel').onchange = () => {
     const k = $('#kindSel').value;
     c.kind = k; S.doc = k; touch(c); saveCases();
-    const empty = Object.keys(AI_FIELDS[k]).every(f => !(c[k][f] || '').trim());
+    const empty = !hasTexts(c, k);
     if(empty && (c.source || c.lastTask || c.facts || (c.chat || []).some(m => m.r === 'u')) && !S.pending){
       // Текстов для этого вида ещё нет — пишем их в чате по тем же материалам
       location.hash = '#chat/' + c.id;
@@ -3366,9 +3458,9 @@ const PHRASES = [
   ['Срок по обращению', 'Срок рассмотрения обращения составляет 30 дней со дня его регистрации (ч. 1 ст. 12 Федерального закона от 02.05.2006 № 59-ФЗ).']
 ];
 const codeShort = l => (CODES[l.code] && CODES[l.code].short) || l.short || l.code;
-const lawRef = l => `ст. ${l.n} ${codeShort(l)}`;
+const lawRef = l => l.pp ? `п. ${l.n} ${l.short || l.code}` : `ст. ${l.n} ${codeShort(l)}`;
 const consUrl = l => CODES[l.code] ? `https://www.consultant.ru/document/${CODES[l.code].cons}/` : 'https://www.consultant.ru/';
-const yandexUrl = l => 'https://yandex.ru/search/?text=' + encodeURIComponent(`статья ${l.n} ${codeShort(l)} консультант`);
+const yandexUrl = l => 'https://yandex.ru/search/?text=' + encodeURIComponent(l.pp ? `пункт ${l.n} ${l.short || ''} консультант` : `статья ${l.n} ${codeShort(l)} консультант`);
 
 // База норм — в IndexedDB: кодексы целиком не помещаются в localStorage.
 // Тексты законов не содержат персональных данных и не шифруются.
@@ -3463,6 +3555,8 @@ function relevantLaws(query, max = 4){
     const cands = code === 'ГК' ? ['ГК1', 'ГК2'] : [code];
     for(const cd of cands){ const e = idx.find(x => x.l.code === cd && x.l.n === m[1]); if(e){ picked.set(e.l.key, e.l); break; } }
   }
+  // «по пленуму о краже», «п. 25 пленума № 29» — нужные пункты постановления
+  if(/пленум/iu.test(query || '')) for(const f of searchBase(query, 2).finds){ const e = idx.find(x => x.l.key === f.key); if(e) picked.set(e.l.key, e.l); }
   const stems = stemsOf(query).slice(0, 40);
   if(stems.length && picked.size < max){
     const n = idx.length || 1;
@@ -3480,7 +3574,7 @@ function relevantLaws(query, max = 4){
   return [...picked.values()];
 }
 
-// --- Образцы: свои документы пользователя, зашифрованы ключом из пароля ----------
+// --- Образцы: свои документы пользователя, зашифрованы отдельным ключом образцов ----------
 const BASE_DB = 'doc-base', SAMPLE_STORE = 'samples', SAMPLE_MAX = 60, SAMPLE_TEXT_MAX = 40000;
 function baseDb(){
   return new Promise((resolve, reject) => {
@@ -3505,13 +3599,13 @@ async function baseTx(mode, fn){
 }
 async function loadSamples(){
   S.samples = [];
-  if(!cryptoKey) return;
+  if(!sampleKey) return;
   try{
-    const key = cryptoKey, out = [];
+    const key = sampleKey, out = [];
     for(const r of (await baseTx('readonly', st => st.getAll())) || []){
       try{ out.push(Object.assign({ id: r.id }, await unseal(key, r.box))); }catch(e){}   // чужой ключ — пропускаем
     }
-    if(cryptoKey === key) S.samples = out.sort((a, b) => b.added - a.added);
+    if(sampleKey === key) S.samples = out.sort((a, b) => b.added - a.added);
   }catch(e){ console.warn('Образцы недоступны:', e); }
 }
 async function addSample(title, text){
@@ -3520,7 +3614,7 @@ async function addSample(title, text){
   if(S.samples.length >= SAMPLE_MAX) throw new Error(`в базе уже ${SAMPLE_MAX} образцов — удалите лишние`);
   const s = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: String(title || 'Образец').replace(/\.(docx?|rtf|pdf|txt|jpe?g|png)$/i, '').slice(0, 120),
     kind: detectKind(title + ' ' + clean.slice(0, 600)) || 'free', text: clean, added: Date.now() };
-  const box = await seal(cryptoKey, { title: s.title, kind: s.kind, text: s.text, added: s.added });   // шифруем до транзакции
+  const box = await seal(sampleKey, { title: s.title, kind: s.kind, text: s.text, added: s.added });   // шифруем до транзакции
   await baseTx('readwrite', st => st.put({ id: s.id, box }));
   S.samples.unshift(s);
   return s;
@@ -3529,19 +3623,18 @@ async function deleteSample(id){
   await baseTx('readwrite', st => st.delete(id));
   S.samples = S.samples.filter(x => x.id !== id);
 }
-// Смена пароля — новый ключ: образцы перешифровываются
-async function resealSamples(){
-  if(!cryptoKey || !S.samples.length) return;
-  const boxes = [];
-  for(const s of S.samples) boxes.push({ id: s.id, box: await seal(cryptoKey, { title: s.title, kind: s.kind, text: s.text, added: s.added }) });
-  await baseTx('readwrite', st => { st.clear(); for(const b of boxes) st.put(b); });
-}
 const clearSamples = () => baseTx('readwrite', st => st.clear()).catch(() => {});
 
 // Чужие данные из образцов и прошлых материалов в нейросеть не уходят: всё, что
 // распознано как ФИО, адрес, дата или номер, заменяется на «…» без возврата
 function anonymize(text, owner){
   return makePseudonymizer(owner || newCase()).apply(text).replace(TOKEN_RE, '«…»');
+}
+// Обезличенный текст образца считается один раз и держится только в памяти
+const anonCache = new WeakMap();
+function anonSample(sample){
+  if(!anonCache.has(sample)) anonCache.set(sample, anonymize(sample.text));
+  return anonCache.get(sample);
 }
 function overlap(stems, text){
   const low = String(text || '').toLowerCase().replace(/ё/g, 'е');
@@ -3672,14 +3765,14 @@ function baseContext(c, query, kind){
     const sample = pickSample(stems, kind);
     if(sample){
       parts.push(`ОБРАЗЕЦ ПОЛЬЗОВАТЕЛЯ «${anonymize(sample.title)}» — пиши в том же стиле и с той же структурой; «…» — скрытые данные, в новый документ их не переноси:\n` +
-        anonymize(sample.text.slice(0, free ? 3000 : 6000)));
-      used.push(`образец «${sample.title}»`);
+        anonSample(sample).slice(0, free ? 3000 : 6000));
+      used.push(`образец «${anonymize(sample.title)}»`);
     }
     const past = pickPastCase(c, stems, kind);
     if(past){
-      const fields = Object.fromEntries(Object.keys(AI_FIELDS[kind]).map(k => [k, anonymize((past[kind][k] || '').slice(0, free ? 700 : 1500), past)]).filter(([, v]) => v.trim()));
+      const fields = Object.fromEntries(Object.keys(AI_FIELDS[kind]).map(k => [k, anonymize(past[kind][k] || '', past).slice(0, free ? 700 : 1500)]).filter(([, v]) => v.trim()));
       parts.push('ПРОШЛЫЙ ДОКУМЕНТ ТОГО ЖЕ ВИДА (образец стиля; «…» — скрытые данные, в новый документ их не переноси):\n' + JSON.stringify(fields));
-      used.push('прошлый материал: ' + caseTitle(past));
+      used.push('прошлый документ того же вида');       // без номера и фамилии: это чужой материал
     }
   }
   parts.push('Готовые формулировки:\n' + PHRASES.map(([t, x]) => `- ${t}: ${x}`).join('\n'));
@@ -3690,6 +3783,249 @@ function baseContext(c, query, kind){
 }
 // Прежнее имя — для разъяснения нормы на странице базы
 const normsBlock = query => baseContext(null, query, '').text;
+
+// =============================================================================
+// ПОИСК ПО БАЗЕ И РАБОТА БЕЗ ИНТЕРНЕТА. Всё в этом разделе выполняется на
+// устройстве, без нейросети и без сети:
+//   — «найди пленум о краже», «покажи ст. 158 УК», «выдержку из п. 25 пленума
+//     № 29»: поиск по загруженным текстам, дословная выдержка, вставка в документ;
+//   — нет сети или нейросеть не ответила: ответ собирается из базы, а документ —
+//     по шаблону из того, что написал пользователь (черновик, проверяется глазами).
+// Выдержки вставляются дословно: точную цитату нейросети не поручаем.
+// =============================================================================
+
+// Постановления Пленума Верховного Суда РФ, нужные по хищениям и проверкам.
+// Здесь только реквизиты; текст пользователь загружает один раз из файла.
+const PLENUMS = [
+  { id: 'ПП29', num: '29', date: '27.12.2002', title: 'О судебной практике по делам о краже, грабеже и разбое', re: /краж|граб[её]ж|разбо|хищен|проникновен|значительн\p{L}*\s+ущерб/iu },
+  { id: 'ПП48', num: '48', date: '30.11.2017', title: 'О судебной практике по делам о мошенничестве, присвоении и растрате', re: /мошеннич|присвоен|растрат|обман|злоупотреблени\p{L}*\s+доверием/iu },
+  { id: 'ПП56', num: '56', date: '17.12.2015', title: 'О судебной практике по делам о вымогательстве (статья 163 Уголовного кодекса Российской Федерации)', re: /вымогат/iu },
+  { id: 'ПП25', num: '25', date: '09.12.2008', title: 'О судебной практике по делам о преступлениях, связанных с нарушением правил дорожного движения и эксплуатации транспортных средств, а также с их неправомерным завладением без цели хищения', re: /угон|неправомерн\p{L}*\s+завладен|дорожн\p{L}*\s+движен/iu },
+  { id: 'ПП45', num: '45', date: '15.11.2007', title: 'О судебной практике по уголовным делам о хулиганстве и иных преступлениях, совершенных из хулиганских побуждений', re: /хулиган/iu },
+  { id: 'ПП19', num: '19', date: '27.06.2013', title: 'О применении судами законодательства, регламентирующего основания и порядок освобождения от уголовной ответственности', re: /освобожден\p{L}*\s+от\s+уголовн|примирен|деятельн\p{L}*\s+раскаян/iu },
+  { id: 'ПП1', num: '1', date: '10.02.2009', title: 'О практике рассмотрения судами жалоб в порядке статьи 125 Уголовно-процессуального кодекса Российской Федерации', re: /жалоб|обжалов|125\s*УПК/iu },
+  { id: 'ПП5', num: '5', date: '24.03.2005', title: 'О некоторых вопросах, возникающих у судов при применении Кодекса Российской Федерации об административных правонарушениях', re: /коап|административн\p{L}*\s+правонаруш|малозначительн/iu }
+];
+const ppShort = p => `постановления Пленума Верховного Суда РФ от ${p.date} № ${p.num}`;
+const ppFull = p => `Постановление Пленума Верховного Суда РФ от ${p.date} № ${p.num} «${p.title}»`;
+const ppLoaded = p => lawList().filter(l => l.code === p.id && lawText(l.key)).length;
+
+// Документ без «Статья N.» режется по пунктам «1.», «2.», «25.1.». Номера должны
+// идти по порядку: нумерованные перечисления внутри пункта пунктами не считаются.
+function splitPoints(text, code, short){
+  const heads = [];
+  let prev = 0;
+  for(const m of String(text || '').matchAll(/^[ \t]*(\d{1,3})(?:\.(\d{1,2}))?\.[ \t]+(?=\S)/gmu)){
+    const major = +m[1];
+    if(major < prev || major > prev + 40 || (major === prev && !m[2])) continue;   // номера идут по возрастанию; пропуски (выдержка, исключённые пункты) допустимы
+    heads.push({ at: m.index, n: m[2] ? `${major}.${+m[2]}` : String(major) });
+    prev = major;
+  }
+  const out = [], seen = new Set();
+  heads.forEach((h, i) => {
+    const body = text.slice(h.at, i + 1 < heads.length ? heads[i + 1].at : text.length).trim();
+    if(body.length < 40 || seen.has(h.n)) return;
+    seen.add(h.n);
+    const first = body.replace(/^\s*[\d.]+\s+/, '').replace(/\s+/g, ' ');
+    out.push({ key: `${code}:${h.n}`, code, n: h.n, title: first.slice(0, 110) + (first.length > 110 ? '…' : ''), short, pp: true, text: body.slice(0, 20000) });
+  });
+  return out.length >= 3 ? out : [];
+}
+// Текст кодекса, пленума или другого документа → в базу
+async function importLawText(target, text){
+  const clean = String(text || '').replace(/\r\n?/g, '\n');
+  let arts = [];
+  if(target.startsWith('pp:')){
+    const p = PLENUMS.find(x => x.id === target.slice(3));
+    if(!p) throw new Error('неизвестное постановление');
+    arts = splitPoints(clean, p.id, ppShort(p));
+    if(!arts.length) throw new Error('в тексте не нашлось пунктов «1.», «2.», «3.»…');
+  } else {
+    const [code, short] = target.startsWith('other:') ? ['Другое:' + target.slice(6), target.slice(6)] : [target, ''];
+    arts = splitArticles(clean, code, short);
+    if(!arts.length && short) arts = splitPoints(clean, code, short);
+    if(!arts.length) throw new Error('в тексте не нашлось заголовков «Статья N.» или пунктов «1.», «2.»…');
+  }
+  await lawTx('readwrite', st => { arts.forEach(a => st.put(a)); });
+  await loadLaws();
+  return arts.length;
+}
+
+// Лучший кусок статьи или пункта под запрос: абзац с наибольшим числом совпавших
+// слов, не длиннее max знаков, обрезанный по концу предложения
+function excerptOf(text, stems, max = 700){
+  const body = String(text || '').replace(/^\s*Статья\s+[\d.]+\.?[^\n]*\n/u, '').replace(/^\s*\d{1,3}(?:\.\d{1,2})?\.\s+/, '').trim();
+  const paras = body.split(/\n+/).map(x => x.replace(/\s+/g, ' ').trim()).filter(x => x.length > 20);
+  if(!paras.length) return body.replace(/\s+/g, ' ').slice(0, max);
+  let best = 0, score = -1;
+  paras.forEach((p, i) => { const sc = overlap(stems, p); if(sc > score){ score = sc; best = i; } });
+  let out = paras[best];
+  for(let i = best + 1; i < paras.length && out.length < 220; i++) out += ' ' + paras[i];
+  if(out.length > max){
+    const cut = out.slice(0, max), end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('; '));
+    out = end > max * 0.5 ? cut.slice(0, end + 1) : cut.replace(/\s+\S*$/, '') + '…';
+  }
+  return out;
+}
+// Поиск для команды «найди…»: точные ссылки, затем пленум по номеру или теме,
+// затем поиск по словам. Возвращает находки с дословной выдержкой.
+function searchBase(query, max = 4){
+  const q = String(query || '');
+  const idx = lawIndex().filter(e => e.x), stems = stemsOf(q.replace(/найди|найти|покажи|приведи|выдержк\p{L}*|вставь|добавь|пленум\p{L}*|постановлени\p{L}*|пункт\p{L}*|стать\p{L}*|текст\p{L}*|документ\p{L}*/giu, ' '));
+  const picked = new Map();
+  const add = l => { if(l && lawText(l.key) && !picked.has(l.key) && picked.size < max) picked.set(l.key, l); };
+  // 1. «ст. 158 УК», «статья 7.27 КоАП»
+  for(const m of q.matchAll(/ст(?:атья|атьи|атье|атью|\.)?\s*(\d+(?:\.\d+)*)\s*(УПК|УК|КоАП|ГК|ТК|СК)/giu)){
+    const code = m[2].toUpperCase() === 'КОАП' ? 'КоАП' : m[2].toUpperCase();
+    for(const cd of code === 'ГК' ? ['ГК1', 'ГК2'] : [code]) add((idx.find(e => e.l.code === cd && e.l.n === m[1]) || {}).l);
+  }
+  // 2. Пленум: по номеру («пленум № 29», «п. 25 пленума 29») или по теме («пленум о краже»)
+  const wantsPp = /пленум/iu.test(q);
+  let pp = null;
+  if(wantsPp){
+    const num = /пленум\p{L}*[^\d\n]{0,40}?(?:№\s*)?(\d{1,3})(?!\d|\.\d)/iu.exec(q);
+    pp = (num && PLENUMS.find(p => p.num === num[1])) || PLENUMS.find(p => p.re.test(q)) || null;
+    const point = /(?:п\.|пункт\p{L}*)\s*(\d{1,3}(?:\.\d{1,2})?)/iu.exec(q);
+    if(pp && point) add((idx.find(e => e.l.code === pp.id && e.l.n === point[1]) || {}).l);
+  }
+  // 3. По словам: в выбранном пленуме, либо среди пленумов, либо по всей базе
+  if(picked.size < max && stems.length){
+    const pool = idx.filter(e => !picked.has(e.l.key) && (pp ? e.l.code === pp.id : wantsPp ? e.l.pp : true));
+    const n = pool.length || 1;
+    const idf = new Map(stems.map(st => [st, Math.log(1 + n / (1 + pool.reduce((k, e) => k + (e.t.includes(st) || e.x.includes(st) ? 1 : 0), 0)))]));
+    // Чем больше разных слов запроса нашлось в пункте, тем он выше; пункт с одним
+    // случайным словом из длинного запроса не показываем
+    const need = stems.length >= 3 ? 2 : 1;
+    pool.map(e => {
+      let sc = 0, hits = 0;
+      for(const st of stems){ const w = e.t.includes(st) ? 3 : e.x.includes(st) ? 1 : 0; if(w){ hits++; sc += w * idf.get(st); } }
+      return [e.l, sc * (0.5 + hits / stems.length), hits];
+    }).filter(([, sc, hits]) => hits >= need && sc >= 1.5).sort((a, b) => b[1] - a[1]).slice(0, max).forEach(([l]) => add(l));
+  }
+  // Пленум назван, а слов для поиска нет — первые пункты
+  if(!picked.size && pp) idx.filter(e => e.l.code === pp.id).slice(0, 2).forEach(e => add(e.l));
+  return { pp, wantsPp, finds: [...picked.values()].map(l => ({ key: l.key, ref: lawRef(l), title: l.pp ? '' : (l.title || ''), text: excerptOf(lawText(l.key), stems) })) };
+}
+// Источник для ссылки в тексте документа: «п. 2 постановления Пленума … № 29 «О …»»
+function findSource(f){
+  const p = PLENUMS.find(x => f.key.startsWith(x.id + ':'));
+  return p ? `${f.ref} «${p.title}»` : f.ref;
+}
+// Поле документа, куда вставляется выдержка
+const INSERT_FIELD = { rf: 'established', ex: 'established', ad: 'established', kr: 'body', free: 'body', nd: 'noticeRights' };
+function insertExcerpt(c, f){
+  const kind = c.kind, field = INSERT_FIELD[kind];
+  if(!field) return false;
+  const quote = `Согласно ${findSource(f)}: «${f.text.replace(/[«»]/g, '"')}»`;
+  c[kind][field] = [(c[kind][field] || '').trim(), quote.replace(/([^.!?…])$/, '$1.')].filter(Boolean).join('\n');
+  touch(c);
+  return true;
+}
+const FIND_RE = /(?:^|[\s,.;:!«(—-])(найди|найти|поищи|покажи|показать|приведи|процитируй|выдержк\p{L}*|цитат\p{L}*|что\s+(?:говорит|сказано|написано|пишет)|где\s+(?:сказано|написано))(?=[\s,.:;!?»)]|$)/iu;
+const FIND_TARGET_RE = /пленум|стать|(?<!\p{L})ст\.|кодекс|норм[аыу]|закон|постановлени|(?<!\p{L})пункт|(?<!\p{L})п\.\s*\d|коап|упк|(?<!\p{L})ук(?!\p{L})|приказ|инструкц|в\s+базе/iu;
+const INSERT_RE = /(?:^|[\s,.;:!«(—-])(вставь|добавь|впиши|включи)(?=[\s,.:;!?»)]|$)/iu;
+const isFind = t => (FIND_RE.test(t) && FIND_TARGET_RE.test(t)) || (INSERT_RE.test(t) && /выдержк|цитат|пленум|текст\p{L}*\s+стать|(?:из|по)\s+(?:стать|ст\.|пункт|п\.)/iu.test(t));
+
+// Ход «найди»: поиск по базе, выдержки карточками; «вставь» — сразу в документ
+function findTurn(c, text){
+  const r = searchBase(text);
+  if(!r.finds.length){
+    const lines = [];
+    if(r.pp) lines.push(`Нужное постановление: **${ppFull(r.pp)}**. Его текста в базе пока нет.`);
+    else if(r.wantsPp) lines.push('В базе нет загруженных постановлений Пленума по этому запросу.');
+    else lines.push('В базе ничего не нашлось по этому запросу.');
+    lines.push('Загрузите текст один раз: меню → «База» → нужный кодекс или постановление → «Загрузить». После этого поиск и выдержки работают и без интернета.');
+    return { t: lines.join('\n\n'), base: true };
+  }
+  const wantInsert = INSERT_RE.test(text) && c.kind && INSERT_FIELD[c.kind];
+  if(wantInsert){
+    insertExcerpt(c, r.finds[0]);
+    return { t: `Вставил в документ дословную выдержку: ${findSource(r.finds[0])}. Проверьте, что редакция действующая.`, doc: c.kind, finds: r.finds.slice(0, 1), used: [r.finds[0].ref] };
+  }
+  return { t: `Нашёл в базе: ${r.finds.length}. Выдержки дословные; редакцию сверяйте с действующей.` +
+      (INSERT_RE.test(text) && !c.kind ? '\n\nДокумента в этом чате ещё нет — когда появится, нажмите «Вставить в документ» под нужной выдержкой.' : ''),
+    finds: r.finds, used: r.finds.map(f => f.ref) };
+}
+
+// --- Без интернета -----------------------------------------------------------------
+const isOffline = () => navigator.onLine === false;
+const NET_ERR_RE = /нет связи|не ответила за|сейчас занята|ответила ошибкой 5/i;
+// Ответ на вопрос без нейросети: памятки, подсказка по сумме, выдержки из базы
+function localAnswer(c, text, why){
+  const guides = GUIDES.filter(g => g.re.test(text)).slice(0, 2);
+  const hint = theftHint(text);
+  const r = searchBase(text, 3);
+  const lines = [why + ' Отвечаю по базе на устройстве, без нейросети.'];
+  for(const g of guides) lines.push(`**${g.title}**\n${g.text}`);
+  if(!guides.length && !hint && !r.finds.length){
+    lines.push('По этому вопросу в базе ничего не нашлось. Без интернета я могу:\n' +
+      '- найти статью или пункт пленума: «найди ст. 158 УК», «найди пленум о краже»;\n' +
+      '- собрать документ по шаблону: «сделай отказной…», «сделай рапорт в КУСП…»;\n' +
+      '- перепечатать документ с фото и вписать данные: «индекс 655012».\n' +
+      'Развёрнутый ответ дам, когда появится сеть, — нажмите «Повторить».');
+  }
+  return { t: lines.join('\n\n'), hint: hint || undefined, finds: r.finds.length ? r.finds : undefined,
+    used: [...guides.map(g => `памятка «${g.title}»`), ...r.finds.map(f => f.ref)], local: true };
+}
+// Суть из сообщения: без команды в начале («Сделай отказной по …: »)
+function storyOf(task){
+  let t = String(task || '').trim();
+  const colon = t.indexOf(':');
+  if(colon > 0 && colon < 90 && MAKE_RE.test(t.slice(0, colon + 1))) t = t.slice(colon + 1).trim();
+  else t = t.replace(/^(?:сделай|составь|подготовь|напиши|оформи|набери|сформируй)\s+[^.,;]{0,80}[.,;]\s*/iu, '');
+  t = t.replace(/\s+/g, ' ').trim();
+  if(!t) return '';
+  t = t[0].toUpperCase() + t.slice(1);
+  return /[.!?…]$/.test(t) ? t : t + '.';
+}
+// Черновик документа по шаблону — когда нейросети нет. Заполняются только пустые
+// поля; формулировки типовые, текст пользователя вставляется как есть.
+const LOCAL_DRAFT_KINDS = ['rf', 'kr', 'nd', 'free', 'ex', 'ad'];
+function localDraft(c, kind, task){
+  if(!LOCAL_DRAFT_KINDS.includes(kind)) return false;
+  const s = S.settings, p = person(c), story = storyOf(task) || (c.facts ? c.facts.trim() : '');
+  const set = (k, v) => { if(v && !(c[kind][k] || '').trim()) c[kind][k] = v; };
+  const kusp = c.kusp ? ` (КУСП № ${c.kusp} от ${fmtDate(c.kuspDate)})` : '';
+  // Дата — из КУСП, если дату сообщения пользователь не называл; шапку не добавляем,
+  // когда он сам начал с «Поступило заявление…»
+  const when = c.msgDate && c.msgDate !== today() ? c.msgDate : (c.kuspDate || c.msgDate);
+  const came = /^поступил/iu.test(story) ? '' : `${fmtDate(when)} в дежурную часть ${s.orgShort} поступило заявление ${p.has ? p.gen : '________'}${kusp}.`;
+  const phrase = name => (PHRASES.find(([t]) => t === name) || [])[1] || '';
+  const sum = damageSum(task);
+  if(kind === 'rf'){
+    const art = c.rf.article || '________';
+    const tail = /п\.\s*1\s*ч/.test(c.rf.basis) ? phrase('Отказ: имущество нашлось')
+      : sum != null && sum <= 2500 ? phrase('Отказ: сумма до 2500 рублей')
+      : `Таким образом, признаков состава преступления, предусмотренного ${art}, не усматривается.`;
+    set('established', [came, story, tail].filter(Boolean).join('\n'));
+    set('noticeExtra', rightsDefault(c, s.orgShort, true));
+  }
+  if(kind === 'kr'){
+    set('body', [came, story].filter(Boolean).join('\n'));
+    const art = /((?:п\.\s*«?[а-яё]»?\s*)?(?:ч\.\s*\d+(?:\.\d+)?\s*)?ст\.\s*\d+(?:\.\d+)*)\s*УК/iu.exec(task || '');
+    if(art) set('qual', `Таким образом, в действиях неустановленного лица усматриваются признаки преступления, предусмотренного ${art[1].replace(/\s+/g, ' ')} УК РФ.`);
+  }
+  if(kind === 'nd'){
+    const low = story ? story[0].toLowerCase() + story.slice(1).replace(/\.$/, '') : '';
+    set('msg', low); set('explain', low);
+    set('nodata', 'Сведений о совершении противоправных действий в ходе проверки не получено.');
+    set('conclusion', 'Таким образом, признаков преступления или административного правонарушения не установлено.');
+    set('noticeFound', 'признаков преступления или административного правонарушения не установлено');
+    set('shortFound', 'признаков преступления или административного правонарушения не установлено');
+    set('noticeRights', rightsDefault(c, s.orgShort));
+  }
+  if(kind === 'free'){
+    const noun = /(?<!\p{L})(рапорт|запрос|справк|объяснени|заявлени|ходатайств|поручени|характеристик|сопроводительн)\p{L}*/iu.exec(task || '');
+    const TITLES = { рапорт: 'РАПОРТ', запрос: 'ЗАПРОС', справк: 'СПРАВКА', объяснени: 'ОБЪЯСНЕНИЕ', заявлени: 'ЗАЯВЛЕНИЕ', ходатайств: 'ХОДАТАЙСТВО', поручени: 'ПОРУЧЕНИЕ', характеристик: 'ХАРАКТЕРИСТИКА', сопроводительн: 'СОПРОВОДИТЕЛЬНОЕ ПИСЬМО' };
+    set('title', noun ? TITLES[noun[1].toLowerCase()] : 'РАПОРТ');
+    set('body', story);
+    if(!c.free.to && /рапорт/iu.test(c.free.title)) c.free.to = [s.chief1, s.chief2, s.chiefRank, s.chiefName].filter(Boolean).join('\n');
+  }
+  if(kind === 'ex') set('established', [came, story].filter(Boolean).join('\n'));
+  if(kind === 'ad') set('established', [came, story].filter(Boolean).join('\n'));
+  touch(c);
+  return true;
+}
 
 async function copyText(t){
   try{ await navigator.clipboard.writeText(t); toast('Скопировано — вставьте в нужное поле документа', 'success'); }
@@ -3707,7 +4043,7 @@ async function askLaw(l, question){
   const text = lawText(l.key);
   const userText = [`Норма: ${lawRef(l)} — «${l.title}».`, text ? `Текст статьи (из КонсультантПлюс):\n${text}` : 'Текст статьи не загружен.',
     c && c.facts ? `Обстоятельства материала: ${ps.apply(c.facts)}` : '', `Вопрос: ${ps.apply(question) || 'Разъясни норму и что из неё следует для заявителя: куда и в каком порядке обращаться.'}`].filter(Boolean).join('\n\n');
-  if(S.settings.confirmAi !== 'нет' && !(await confirmPayload(userText))) return;
+  if(needConfirm() && !(await confirmPayload(userText))) return;
   const note = document.createElement('div'); note.className = 'toast'; note.textContent = 'ИИ разбирает норму…'; $('#toasts').appendChild(note);
   try{
     const out = await callAi(userText, '"explain": разъяснение нормы простым языком, 3–8 предложений\n"phrase": готовый абзац для вставки в документ (что разъяснено заявителю, куда и в каком порядке обращаться, со ссылкой на статью)', LAW_SYSTEM);
@@ -3749,6 +4085,20 @@ async function renderLaws(){
   ${S.samples.map(x => `<div class="case"><div class="case-b"><div class="case-t">${escapeHtml(x.title)}</div>
     <div class="case-m">${escapeHtml((DOCS[x.kind] || DOCS.free).name)} · ${escapeHtml(Math.round(x.text.length / 1000))} тыс. знаков · ${escapeHtml(new Date(x.added).toLocaleDateString('ru-RU'))}</div></div>
     <button class="x" data-sdel="${escapeHtml(x.id)}" aria-label="Удалить образец">×</button></div>`).join('')}
+</div>
+<div class="card">
+  <div class="card-t">Пленумы Верховного Суда</div>
+  <div class="hint" style="margin:0 0 6px">Загрузите текст постановления один раз (файл из КонсультантПлюс или «Гаранта» либо вставьте скопированный текст) —
+    и в чате можно писать: «найди пленум о краже про значительный ущерб», «вставь в текст выдержку из п. 2 пленума № 29». Поиск работает и без интернета.</div>
+  ${PLENUMS.map(p => { const n = ppLoaded(p); return `<div class="case"><div class="case-b">
+    <div class="case-t" style="white-space:normal">№ ${escapeHtml(p.num)} от ${escapeHtml(p.date)} — ${escapeHtml(p.title)}</div>
+    <div class="case-m">${n ? 'загружено пунктов: ' + n : 'текст не загружен'}</div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn sm${n ? '' : ' gold'}" data-ppfile="${escapeHtml(p.id)}">${n ? 'Обновить из файла' : 'Загрузить файл'}</button>
+      <button class="btn sm" data-pppaste="${escapeHtml(p.id)}">Вставить текст</button>
+      <a class="btn sm" href="${escapeHtml('https://yandex.ru/search/?text=' + encodeURIComponent(ppFull(p) + ' текст'))}" target="_blank" rel="noopener noreferrer">Найти текст</a>
+    </div></div></div>`; }).join('')}
+  <div class="hint">Другой документ (приказ, инструкцию, иное постановление) загрузите ниже: «Кодекс / закон» → «Другой» — он будет разрезан по статьям или пунктам.</div>
 </div>
 <details class="card">
   <summary class="card-t" style="margin:0;cursor:pointer">Памятки по хищениям: ${GUIDES.length}</summary>
@@ -3808,6 +4158,12 @@ async function renderLaws(){
     $$('[data-text]').forEach(b => b.onclick = () => editLawText(byKey(b.dataset.text)));
   };
   $('#lawQ').addEventListener('input', draw);
+  $$('[data-ppfile]').forEach(b => b.onclick = () => {
+    const fi = $('#importFile');
+    fi.accept = '.doc,.docx,.rtf,.pdf,.txt'; fi.dataset.mode = 'laws'; fi.dataset.case = 'pp:' + b.dataset.ppfile;
+    fi.value = ''; fi.click();
+  });
+  $$('[data-pppaste]').forEach(b => b.onclick = () => pasteLawText('pp:' + b.dataset.pppaste, ppFull(PLENUMS.find(p => p.id === b.dataset.pppaste))));
   $('#sampleAdd').onclick = () => {
     const fi = $('#importFile');
     fi.accept = '.doc,.docx,.rtf,.pdf,.txt,image/*'; fi.dataset.mode = 'sample'; fi.dataset.case = '';
@@ -3828,6 +4184,25 @@ async function renderLaws(){
     fi.value = ''; fi.click();
   };
   draw();
+}
+// Окно «вставить текст»: постановление, скопированное с сайта или из справочной системы
+function pasteLawText(target, title){
+  const box = document.createElement('div');
+  box.className = 'modal';
+  box.innerHTML = `<div class="modal-h"><div class="modal-t" style="font-size:16px">${escapeHtml(title)}</div><button class="btn sm" data-a="close">Закрыть</button></div>
+    <div class="modal-b"><textarea id="pasteText" class="big" style="min-height:55vh;background:#fff" placeholder="Вставьте сюда весь текст документа"></textarea>
+    <div class="row" style="margin-top:10px"><button class="btn gold" data-a="save">Сохранить в базу</button></div></div>`;
+  box.addEventListener('click', async e => {
+    const a = e.target.closest('[data-a]')?.dataset.a;
+    if(a === 'close') box.remove();
+    if(a === 'save'){
+      try{
+        const n = await importLawText(target, box.querySelector('#pasteText').value);
+        box.remove(); toast(`Загружено в базу: ${n}`, 'success', 5000); renderLaws();
+      }catch(err){ toast('Не удалось загрузить: ' + err.message, 'error', 6000); }
+    }
+  });
+  document.body.appendChild(box);
 }
 function editLawText(l){
   const box = document.createElement('div');
@@ -3964,7 +4339,9 @@ function renderSettings(){
     const a = $('#pin1').value, b = $('#pin2').value;
     if(a.length < PIN_MIN){ toast(`Пароль — не короче ${PIN_MIN} символов`, 'error'); return; }
     if(a !== b){ toast('Пароли не совпадают', 'error'); return; }
+    const gen = lockGen;
     if(!(await checkPin($('#pin0').value))){ toast('Текущий пароль неверный', 'error'); return; }
+    if(!stillOpen(gen)) return;                    // пока проверялся пароль, приложение заблокировали
     // Пока шифровалось, могли уйти на другой экран — тогда не перерисовываем
     try{ await setPin(a); resetIdle(); toast('Пароль изменён', 'success'); if(location.hash === '#settings') renderSettings(); }
     catch(e){ toast('Не удалось: ' + e.message, 'error'); }
@@ -4013,7 +4390,7 @@ $('#importFile').addEventListener('change', async e => {
             : await anyText(await file.arrayBuffer(), file.name.toLowerCase());
           if(!stillOpen(gen)) return;
           await addSample(file.name, text); added++;
-        }catch(err){ toast(`${file.name}: ${err.message}`, 'error', 6000); }
+        }catch(err){ if(!stillOpen(gen)) return; toast(`${file.name}: ${err.message}`, 'error', 6000); }
       }
     }finally{ b.done(); }
     if(added) toast(`Образцов добавлено: ${added}`, 'success');
@@ -4023,16 +4400,9 @@ $('#importFile').addEventListener('change', async e => {
   let c = mode === 'laws' ? null : findCase(e.target.dataset.case);
   if(!c && mode !== 'laws'){ c = newCase(); S.cases.push(c); }
   if(mode === 'laws'){
-    const target = e.target.dataset.case || '';
-    const [code, short] = target.startsWith('other:') ? ['Другое:' + target.slice(6), target.slice(6)] : [target, ''];
     try{
-      const buf = await files[0].arrayBuffer(), name = files[0].name.toLowerCase();
-      const text = await anyText(buf, name);
-      const arts = splitArticles(text, code, short);
-      if(!arts.length){ toast('В файле не нашлось заголовков «Статья N.»', 'error', 6000); return; }
-      await lawTx('readwrite', st => arts.forEach(a => st.put(a)));
-      await loadLaws();
-      toast(`Загружено статей: ${arts.length}`, 'success', 5000);
+      const n = await importLawText(e.target.dataset.case || '', await anyText(await files[0].arrayBuffer(), files[0].name.toLowerCase()));
+      toast(`Загружено в базу: ${n}`, 'success', 5000);
       renderLaws();
     }catch(err){ toast('Не удалось загрузить: ' + err.message, 'error', 6000); }
     return;
@@ -4102,6 +4472,7 @@ let loginReturned = handleLoginReturn();
 loadLaws();
 if(!pinEnabled()){ S.cases = loadJson(LS_CASES, []); S.zips = loadJson(LS_ZIPS, {}); }
 bindShell();
+for(const ev of ['online', 'offline']) window.addEventListener(ev, () => { const el = $('#compHint'); if(el && cryptoKey) el.textContent = netHint(); });
 window.addEventListener('hashchange', route);
 route();
 
