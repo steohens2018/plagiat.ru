@@ -73,8 +73,8 @@ button{font:inherit;cursor:pointer}
 body[data-state=locked] .side,body[data-state=locked] .top,body[data-state=locked] .scrim{display:none!important}
 @media(min-width:900px){#menuBtn{visibility:hidden}}
 @media(max-width:899px){
-  .side{position:fixed;left:0;top:0;z-index:60;width:min(86vw,320px);transform:translateX(-102%);transition:transform .2s ease;box-shadow:0 0 40px rgba(12,43,102,.25)}
-  body.side-open .side{transform:none}
+  .side{position:fixed;left:0;top:0;z-index:60;width:min(86vw,320px);transform:translateX(-102%);transition:transform .2s ease}
+  body.side-open .side{transform:none;box-shadow:0 0 40px rgba(12,43,102,.25)}
   body.side-open .scrim{display:block;position:fixed;inset:0;z-index:55;background:rgba(12,20,45,.35)}
   #sideClose{display:inline-flex}
 }
@@ -198,7 +198,8 @@ select{background-image:linear-gradient(45deg,transparent 50%,var(--dim) 50%),li
 .chip{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chip button{border:0;background:transparent;color:var(--navy);font-size:17px;line-height:1;padding:2px 8px}
 .dl{position:sticky;top:calc(var(--top) + env(safe-area-inset-top));z-index:5;background:var(--bg);padding:8px 0;margin-bottom:6px}
-.dl>.btn{flex:1 1 0;padding-left:8px;padding-right:8px}
+.dl>.btn{flex:1 1 0;padding-left:8px;padding-right:8px;white-space:nowrap}
+.dl>.btn:first-child{flex:1.7 1 0}
 details>summary{list-style:none}
 details>summary::-webkit-details-marker{display:none}
 details.card>summary::after{content:' ▾'}
