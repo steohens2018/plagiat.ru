@@ -4,7 +4,7 @@ const CACHE = 'snd-v1';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'js/util.js', 'js/decl.js', 'js/data.js', 'js/store.js', 'js/mask.js', 'js/photo.js', 'js/ai.js', 'js/docx.js', 'js/selfdata.js', 'js/selftest.js', 'js/app.js',
-  'vendor/pizzip.min.js', 'vendor/docxtemplater.min.js', 'vendor/heic2any.min.js',
+  'vendor/pizzip.min.js', 'vendor/docxtemplater.min.js', 'vendor/heic2any.min.js', 'vendor/heic.html', 'vendor/heic-frame.js',
   'vendor/ocr/tesseract.min.js', 'vendor/ocr/worker.min.js', 'vendor/ocr/tesseract-core-simd-lstm.wasm.js', 'vendor/ocr/tesseract-core-lstm.wasm.js', 'vendor/ocr/rus.traineddata.gz',
   'templates/uvedomlenie.docx', 'templates/raport_snd.docx', 'templates/raport_proverka.docx', 'templates/raport_priobshenie.docx',
   'templates/telefonogramma.docx', 'templates/mfo_raport.docx', 'templates/mfo_uvedomlenie.docx',

@@ -15,6 +15,9 @@ function createMasker(saved){
   const byKey = new Map();      // вид|ключ → метка
   const persons = [];           // люди: { token, sur, surKey, name, nameKey, patr, i1, i2 }
   const manual = [];            // замаскировано вручную: { text, token }
+  const ctxForms = new Map();   // метка|слово слева → фамилия в том падеже, в каком она стояла после этого слова
+  let lastSur = '';
+  const leftWord = t => { const m = /([\p{L}-]+)[\s«»"'(),.:;—–-]*$/u.exec(t); return m ? norm(m[1]) : ''; };
   const counters = {};
   const norm = s => String(s).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
   const tc = w => w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w;   // ИВАНОВ → Иванов
@@ -51,6 +54,7 @@ function createMasker(saved){
   const fit = (a, b) => !a || !b || a === b;
   function personToken(p){
     const sur = p.sur ? tc(p.sur) : '', name = p.name ? tc(p.name) : '', patr = p.patr ? tc(p.patr) : '';
+    lastSur = sur;
     const q = { sur, surKey: sur ? surStem(sur) : '', name, nameKey: name ? nameStem(name) : '', patr,
       i1: ini(name) || ini(p.i1), i2: ini(patr) || ini(p.i2) };
     let cand = [];
@@ -181,7 +185,14 @@ function createMasker(saved){
     let out = String(text || '');
     const pass = (re, fn) => {
       out = out.split(TOKEN_SPLIT).map(seg => TOKEN_SPLIT.test(seg) && seg.startsWith('[') ? seg
-        : seg.replace(re, (...a) => { const m = a.slice(0, a.findIndex(x => typeof x === 'number')); return fn(m); })).join('');
+        : seg.replace(re, (...a) => {
+          const i = a.findIndex(x => typeof x === 'number'), m = a.slice(0, i);
+          lastSur = '';
+          const res = fn(m), tk = (TOKEN_SPLIT.exec(res) || [])[1];
+          // Запоминаем, в каком падеже фамилия стояла после этого слова: пригодится, когда метку раскрываем обратно
+          if(lastSur && tk){ const left = leftWord(seg.slice(0, a[i]) + res.slice(0, res.indexOf(tk))); if(left) ctxForms.set(tk + '|' + left, lastSur); }
+          return res;
+        })).join('');
     };
     for(const x of manual) pass(new RegExp(escRe(x.text).replace(/\s+/g, '\\s+').replace(/[её]/g, '[её]'), 'giu'), () => x.token);
     for(const [re, fn] of rules) pass(re, fn);
@@ -211,17 +222,18 @@ function createMasker(saved){
       const [f, i, o] = personParts(x);
       const sex = sexOf({ i, o });
       const inis = [x.i1, x.i2].filter(Boolean).map(c => c.toUpperCase() + '.').join('');
-      const sur = GEN_CUE.test(all.slice(Math.max(0, pos - 40), pos)) ? declineSurname(f, sex, 'gen') : f;
+      const before = all.slice(Math.max(0, pos - 40), pos);
+      const sur = ctxForms.get(t + '|' + leftWord(before)) || (GEN_CUE.test(before) ? declineSurname(f, sex, 'gen') : f);
       return [inis, sur].filter(Boolean).join(' ');
     });
   }
   const table = () => [...items].map(([token, v]) => ({ token, kind: v.kind, value: v.value }));
   const personOf = token => { const x = persons.find(p => p.token === token); if(!x) return null; const [f, i, o] = personParts(x); return { f: f || '', i: i || '', o: o || '' }; };
   // Сохранение и восстановление таблицы (внутри зашифрованного материала)
-  const dump = () => ({ items: [...items], byKey: [...byKey], persons, manual, counters });
+  const dump = () => ({ items: [...items], byKey: [...byKey], persons, manual, counters, ctx: [...ctxForms] });
   if(saved && saved.items){
     saved.items.forEach(([k, v]) => items.set(k, v)); saved.byKey.forEach(([k, v]) => byKey.set(k, v));
-    persons.push(...saved.persons); manual.push(...saved.manual); Object.assign(counters, saved.counters);
+    persons.push(...saved.persons); manual.push(...saved.manual); Object.assign(counters, saved.counters); (saved.ctx || []).forEach(([k, v]) => ctxForms.set(k, v));
   }
   return { mask, unmask, addManual, table, personOf, dump, valueOf: t => (items.get(t) || {}).value || '' };
 }

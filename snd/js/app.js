@@ -46,7 +46,8 @@ function lockApp(){
   [...openModals].forEach(close => close(''));
   if(Photo._closeRedactor) Photo._closeRedactor();
   $('#toasts').textContent = '';
-  clearTimeout(App.idle);
+  $('#title').textContent = 'СНД';            // в шапке не должно остаться номера КУСП и фамилии
+  clearTimeout(App.idle); clearTimeout(saveTimer);
   render();
 }
 function touchIdle(){

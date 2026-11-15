@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Преобразование HEIC</title>
+<!-- Отдельная страница-песочница: библиотеке heic2any нужен eval, основному приложению он запрещён.
+     Сети здесь нет вообще, а страница открывается в изолированной рамке без доступа к данным приложения. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-eval' blob:; worker-src blob:; child-src blob:">
+<script src="heic2any.min.js"></script>
+<script src="heic-frame.js"></script>
+</head>
+<body></body>
+</html>

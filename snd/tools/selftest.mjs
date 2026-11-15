@@ -5,7 +5,7 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 const pw = createRequire(import.meta.url)(execSync('npm root -g', { encoding: 'utf8' }).trim() + '/playwright');
 const URL0 = process.argv[2] || 'http://localhost:8770/', OUT = process.argv[3] || '';
-const browser = await pw.chromium.launch();
+const browser = await pw.chromium.launch({ env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' } });
 const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, serviceWorkers: 'block' });
 const page = await ctx.newPage();
 const errors = []; page.on('pageerror', e => errors.push(e.message)); page.on('console', m => { if(m.type() === 'error') errors.push(m.text()); });

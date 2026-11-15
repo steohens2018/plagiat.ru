@@ -20,13 +20,31 @@ const Photo = {
       const heic = /heic|heif/i.test(file.type) || /\.(heic|heif)$/i.test(file.name || '');
       if(!heic) throw new Error('Не удалось открыть фото: ' + e.message + '. Сохраните его как JPEG или сделайте снимок экрана.');
       try {
-        await loadScript('vendor/heic2any.min.js');
-        const jpg = await window.heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 });
-        return await tryBitmap(Array.isArray(jpg) ? jpg[0] : jpg);
+        return await tryBitmap(await this.heicToJpeg(file));
       } catch(e2){
         throw new Error('Фото в формате HEIC не удалось преобразовать. На iPhone: Настройки → Камера → Форматы → «Наиболее совместимый», либо отправьте снимок экрана.');
       }
     }
+  },
+  // HEIC → JPEG в изолированной рамке (vendor/heic.html): библиотеке нужен eval, приложению он запрещён.
+  // Рамка без доступа к данным приложения и без сети; общение — только сообщениями.
+  heicToJpeg(file){
+    return new Promise((res, rej) => {
+      const fr = document.createElement('iframe'), id = uid();
+      fr.hidden = true; fr.src = 'vendor/heic.html';
+      // В сети рамка полностью изолирована. Без сети изолированную рамку service worker не обслуживает,
+      // поэтому она открывается как обычная страница приложения — со своим запретом на любые сетевые запросы.
+      if(navigator.onLine) fr.setAttribute('sandbox', 'allow-scripts');
+      const done = (fn, v) => { clearTimeout(timer); window.removeEventListener('message', onMsg); fr.remove(); fn(v); };
+      const onMsg = e => {
+        if(e.source !== fr.contentWindow || !e.data) return;
+        if(e.data.ready) fr.contentWindow.postMessage({ id, blob: file }, '*');
+        else if(e.data.id === id) e.data.blob instanceof Blob ? done(res, e.data.blob) : done(rej, new Error(e.data.error || 'ошибка преобразования'));
+      };
+      const timer = setTimeout(() => done(rej, new Error('преобразование не завершилось')), 60000);
+      window.addEventListener('message', onMsg);
+      document.body.appendChild(fr);
+    });
   },
   // Холст не больше maxSide по длинной стороне; turn — поворот на 90° по часовой стрелке (0–3)
   canvas(src, maxSide = 2200, turn = 0){

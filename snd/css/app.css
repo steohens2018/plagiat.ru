@@ -5,6 +5,7 @@
   --r:14px; --pad:16px;
 }
 *{box-sizing:border-box}
+[hidden]{display:none !important}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   min-height:100dvh;padding-bottom:env(safe-area-inset-bottom)}

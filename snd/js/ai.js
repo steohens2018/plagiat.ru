@@ -216,6 +216,8 @@ function applyFields(c, fields, masker, source){
   if(fields.kusp_date) set('kuspDate', toIso(fields.kusp_date));
   if(fields.msg_date) set('msgDate', toIso(fields.msg_date));
   if(fields.msg_time) set('msgTime', fields.msg_time);
-  for(const k of ['fabula', 'explain', 'found']) if(fields[k]) set(k, masker.unmask(fields[k]).replace(/\[(?:закрыто|неразборчиво)\]/g, '________'));
+  // Модель иногда повторяет вводную фразу («поступило сообщение о том, что …») — в шаблоне она уже есть
+  const LEAD = { fabula: /^(?:поступило\s+)?(?:сообщение|заявление|обращение)?[^.]{0,60}?о том,?\s*что\s+/iu, explain: /^(?:он[а]?\s+)?поясн[а-яё]+,?\s*что\s+/iu, found: /^(?:в ходе проверки\s+)?установлено,?\s*что\s+/iu };
+  for(const k of ['fabula', 'explain', 'found']) if(fields[k]) set(k, masker.unmask(fields[k].replace(LEAD[k], '')).replace(/\[(?:закрыто|неразборчиво)\]/g, '________'));
   c.uncertain = [...new Set([...(source === 'ai' ? [] : c.uncertain || []), ...[...doubt].flatMap(k => MAP[k] || [])])];
 }
