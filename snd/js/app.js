@@ -658,5 +658,5 @@ async function renderSelftest(){
 const APP_VERSION = '1.0';
 if('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('sw.js').catch(() => {});
 if(!window.isSecureContext || !crypto.subtle){
-  app().innerHTML = '<div class="note warn">Приложение работает только по защищённому адресу (https://). Откройте его по ссылке хостинга.</div>';
+  app().innerHTML = '<div class="note warn">Приложение работает только по защищённому адресу: по ссылке https:// с хостинга или на компьютере через файл «Запустить» (адрес http://localhost:8765/). Если просто открыть index.html двойным щелчком, шифрование и работа без сети недоступны.</div>';
 } else render().catch(e => { app().innerHTML = `<div class="note warn">${E(e.message)}</div>`; });
