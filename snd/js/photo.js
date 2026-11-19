@@ -83,6 +83,7 @@ const Photo = {
     return new Promise(resolve => {
       const el = document.createElement('div');
       el.className = 'redactor';
+      const tb = document.querySelector('#toasts'); if(tb) tb.textContent = '';   // уведомления не должны закрывать кнопки редактора
       el.innerHTML = `
         <div class="red-top">
           <b>Закрасьте персональные данные</b>
@@ -90,7 +91,7 @@ const Photo = {
         </div>
         <div class="red-scroll"><canvas></canvas></div>
         <div class="red-bar">
-          <label class="red-range">Шапка: <output>${headerPct}</output>%
+          <label class="red-range"><span>Закрашенная шапка бланка:</span><output>${headerPct}</output><span>% высоты</span>
             <input type="range" min="0" max="70" value="${headerPct}" aria-label="Высота закрашенной шапки"></label>
           <div class="row">
             <button type="button" class="btn sm" data-a="mode">Листать</button>
